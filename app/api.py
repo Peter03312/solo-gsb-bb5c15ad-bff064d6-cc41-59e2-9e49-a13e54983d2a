@@ -12,6 +12,7 @@ from .models import (
     CertCorrectRequest,
     CertIssueRequest,
     CertRevokeRequest,
+    ReadingAdjudicateRequest,
     ReadingSubmitRequest,
     UtcDatetime,
 )
@@ -99,6 +100,22 @@ def submit_readings(req: ReadingSubmitRequest) -> dict:
     return service.submit_readings(req.model_dump())
 
 
+@router.post("/readings/{reading_no}/adjudications")
+def adjudicate_reading(reading_no: str, req: ReadingAdjudicateRequest) -> dict:
+    """对处于 review 的读数人工选择候选证书版本进行裁决。
+
+    - 成功占用一个全局版本，按所选证书闭区间给出 conforming / out_of_range；
+    - basis_version 必须等于当前全局版本，否则 409 stale_basis_version；
+    - 读数不存在 404；依据版本视角非 review / 已有生效裁决 409；
+      所选证书版本不存在或不属于该视角候选 422；拒绝均不产生新版本。
+    """
+    data = req.model_dump()
+    if data["reading_no"] != reading_no:
+        raise ApiError(422, "path_body_mismatch",
+                       "reading_no in path and body must match")
+    return service.adjudicate_reading(data)
+
+
 @router.get("/readings")
 def list_readings(
     at_version: Optional[int] = Query(default=None, ge=1),
@@ -118,6 +135,16 @@ def get_reading(
 ) -> dict:
     with get_conn() as conn:
         out = service.get_reading(conn, reading_no, at_version)
+        if out is None:
+            raise ApiError(404, "unknown_reading", f"reading {reading_no!r} not found")
+        return out
+
+
+@router.get("/readings/{reading_no}/adjudications")
+def adjudication_history(reading_no: str) -> dict:
+    """读数的人工裁决流水（只增；含失效版本与理由）。"""
+    with get_conn() as conn:
+        out = service.adjudication_history(conn, reading_no)
         if out is None:
             raise ApiError(404, "unknown_reading", f"reading {reading_no!r} not found")
         return out

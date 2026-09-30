@@ -12,6 +12,15 @@ from typing import Iterator
 
 from .config import get_settings
 
+# 版本事件类型：四类证书/读数事件 + 人工选证裁决
+VERSION_EVENT_TYPES = (
+    "cert_issue",
+    "cert_correct",
+    "cert_revoke",
+    "reading_submit",
+    "reading_adjudicate",
+)
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -19,7 +28,7 @@ PRAGMA foreign_keys=ON;
 -- 全局单调版本流水：每次成功变更产生一条记录，version 由 INTEGER PRIMARY KEY 自增
 CREATE TABLE IF NOT EXISTS versions (
     version                INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_type             TEXT NOT NULL CHECK (event_type IN ('cert_issue','cert_correct','cert_revoke','reading_submit')),
+    event_type             TEXT NOT NULL CHECK (event_type IN ('cert_issue','cert_correct','cert_revoke','reading_submit','reading_adjudicate')),
     request_id             TEXT NOT NULL UNIQUE,
     request_payload_json   TEXT NOT NULL,
     fingerprint            TEXT NOT NULL,
@@ -65,7 +74,76 @@ CREATE TABLE IF NOT EXISTS readings (
     created_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_readings_device_time ON readings(device_no, measured_at);
+
+-- 人工选证裁决（只追加，永不覆盖）：对处于 review 的读数选择一份候选证书版本
+CREATE TABLE IF NOT EXISTS adjudications (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    reading_no                TEXT NOT NULL REFERENCES readings(reading_no),
+    -- 裁决结果：按所选证书闭区间判定
+    decision                  TEXT NOT NULL CHECK (decision IN ('conforming','out_of_range')),
+    certificate_no            TEXT NOT NULL,
+    certificate_version_seq   INTEGER NOT NULL,
+    -- 裁决所依据的当前全局版本（该视角下读数必须为 review，所选版本必须是候选）
+    basis_version             INTEGER NOT NULL REFERENCES versions(version),
+    reason                    TEXT,
+    adjudicate_version        INTEGER NOT NULL UNIQUE REFERENCES versions(version),
+    -- 所选证书版本日后被纠正/撤销而失效的版本；为空表示裁决仍有效
+    invalidated_at_version    INTEGER REFERENCES versions(version),
+    created_at                TEXT NOT NULL,
+    FOREIGN KEY (certificate_no, certificate_version_seq)
+        REFERENCES certificate_versions (certificate_no, version_seq)
+);
+-- 按读数取裁决流水；同读数在原裁决失效后可再次裁决
+CREATE INDEX IF NOT EXISTS idx_adjudications_reading
+    ON adjudications(reading_no, adjudicate_version);
+-- 证书版本被纠正/撤销时批量失效相关裁决
+CREATE INDEX IF NOT EXISTS idx_adjudications_certver
+    ON adjudications(certificate_no, certificate_version_seq);
 """
+
+
+def _migrate_versions_check(conn: sqlite3.Connection) -> None:
+    """旧库 versions 表的 event_type CHECK 不包含 reading_adjudicate，
+    在不丢数据的前提下重建该表（SQLite 不能直接修改列约束）。
+    新库的 CHECK 已含全部事件，检测到即跳过。"""
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='versions'"
+    ).fetchone()
+    # 全新库：versions 尚不存在，直接由 SCHEMA 创建，无需迁移
+    if ddl is None:
+        return
+    # 新库的 CHECK 已含全部事件
+    if "reading_adjudicate" in (ddl["sql"] or ""):
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("ALTER TABLE versions RENAME TO versions_legacy")
+        conn.execute(
+            "CREATE TABLE versions ("
+            "version INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "event_type TEXT NOT NULL CHECK (event_type IN "
+            "('cert_issue','cert_correct','cert_revoke','reading_submit','reading_adjudicate')),"
+            "request_id TEXT NOT NULL UNIQUE,"
+            "request_payload_json TEXT NOT NULL,"
+            "fingerprint TEXT NOT NULL,"
+            "response_json TEXT,"
+            "created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO versions (version, event_type, request_id,"
+            " request_payload_json, fingerprint, response_json, created_at)"
+            " SELECT version, event_type, request_id, request_payload_json,"
+            " fingerprint, response_json, created_at FROM versions_legacy"
+        )
+        conn.execute("DROP TABLE versions_legacy")
+        # 保留原有自增序列，新版本号继续单调递增
+        seq = conn.execute("SELECT COALESCE(MAX(version),0) AS m FROM versions").fetchone()["m"]
+        conn.execute(
+            "INSERT OR IGNORE INTO sqlite_sequence(name, seq) VALUES ('versions', ?)", (seq,)
+        )
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -85,6 +163,8 @@ def init_db() -> None:
     """创建表结构并初始化数据库（幂等，可重复执行）。"""
     conn = _connect(get_settings().db_path)
     try:
+        # 旧库先把 versions 的 event_type 约束升级到含 reading_adjudicate
+        _migrate_versions_check(conn)
         conn.executescript(SCHEMA)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
