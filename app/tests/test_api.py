@@ -757,3 +757,363 @@ def test_16_audit_errors(client):
 
     # 报错后没有任何半成品：服务仍可用、当前版本不变
     assert client.get(f"{API}/status").json()["current_version"] == latest
+
+
+# ---------------- 人工选证裁决
+
+
+def test_17_adjudicate_review_reading_success_and_replay(client):
+    # 两份证书覆盖同一测量时刻 -> review；选其一人工裁决
+    r = client.post(f"{API}/certificates", json={
+        "request_id": "req-adj-c1",
+        "certificate_no": "CERT-ADJ-1", "device_no": "DADJ",
+        "valid_from": "2026-05-01T00:00:00Z", "valid_to": "2026-06-01T00:00:00Z",
+        "min_value": 0.0, "max_value": 10.0,
+    })
+    assert r.status_code == 200
+    r = client.post(f"{API}/certificates", json={
+        "request_id": "req-adj-c2",
+        "certificate_no": "CERT-ADJ-2", "device_no": "DADJ",
+        "valid_from": "2026-05-01T00:00:00Z", "valid_to": "2026-06-01T00:00:00Z",
+        "min_value": 100.0, "max_value": 200.0,
+    })
+    assert r.status_code == 200
+    r = client.post(f"{API}/readings", json={
+        "request_id": "req-adj-read",
+        "readings": [{
+            "reading_no": "ADJ-1", "device_no": "DADJ",
+            "measured_at": "2026-05-10T00:00:00Z", "value": 5.0,
+        }],
+    })
+    assert r.status_code == 200
+    read_v = r.json()["version"]
+    assert r.json()["results"][0]["status"] == "review"
+
+    adj_payload = {
+        "request_id": "req-adj-do",
+        "reading_no": "ADJ-1",
+        "certificate_no": "CERT-ADJ-1",
+        "certificate_version_seq": 1,
+        "base_version": read_v,
+        "reason": "CERT-ADJ-1 为有效校准证书",
+    }
+    r = client.post(f"{API}/readings/ADJ-1/adjudications", json=adj_payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    adj_v = body["version"]
+    assert adj_v == read_v + 1
+    assert body["event_type"] == "reading_adjudicate"
+    # 按所选证书闭区间：5.0 ∈ [0,10] -> conforming
+    assert body["status"] == "conforming"
+    assert body["reliance"]["certificate_no"] == "CERT-ADJ-1"
+    assert body["reliance"]["version_seq"] == 1
+    # 保留全部候选
+    assert {(c["certificate_no"], c["version_seq"]) for c in body["candidates"]} == {
+        ("CERT-ADJ-1", 1), ("CERT-ADJ-2", 1),
+    }
+    adj = body["adjudication"]
+    assert adj["active"] is True
+    assert adj["adjudicated_at_version"] == adj_v
+    assert adj["base_version"] == read_v
+    assert adj["selected_certificate"]["certificate_no"] == "CERT-ADJ-1"
+    assert adj["invalidated"] is False
+    assert adj["invalidated_at_version"] is None
+    # 裁决依据：base_version 视角自动结论为 review + 全部候选
+    assert body["basis"]["base_version"] == read_v
+    assert body["basis"]["status"] == "review"
+    assert len(body["basis"]["candidates"]) == 2
+
+    # 当前读数查询呈现裁决
+    g = client.get(f"{API}/readings/ADJ-1").json()
+    assert g["status"] == "conforming"
+    assert g["adjudication"]["active"] is True
+    assert g["adjudication"]["request_id"] == "req-adj-do"
+
+    # 相同 request_id + 内容重复提交：沿用首次结果，不产生新版本
+    r = client.post(f"{API}/readings/ADJ-1/adjudications", json=adj_payload)
+    assert r.status_code == 200
+    assert r.json()["idempotent_replay"] is True
+    assert r.json()["version"] == adj_v
+    assert client.get(f"{API}/status").json()["current_version"] == adj_v
+
+    # 同 request_id 异内容冲突
+    r = client.post(f"{API}/readings/ADJ-1/adjudications", json={
+        **adj_payload, "certificate_no": "CERT-ADJ-2",
+    })
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "request_id_conflict"
+
+    # 列表按版本呈现裁决结论
+    rows = client.get(f"{API}/readings", params={
+        "device_no": "DADJ", "status": "conforming",
+    }).json()["items"]
+    assert any(i["reading_no"] == "ADJ-1" and
+               i["adjudication"]["adjudicated_at_version"] == adj_v for i in rows)
+
+
+def test_18_adjudication_rejections(client):
+    read_v = client.get(f"{API}/readings/ADJ-1").json()["submitted_at_version"]
+    latest = client.get(f"{API}/status").json()["current_version"]
+
+    # 依据版本不等于当前版本 -> 409 stale_base_version，不产生新版本
+    r = client.post(f"{API}/readings/ADJ-1/adjudications", json={
+        "request_id": "req-adj-stale", "reading_no": "ADJ-1",
+        "certificate_no": "CERT-ADJ-1", "certificate_version_seq": 1,
+        "base_version": read_v, "reason": "stale",
+    })
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "stale_base_version"
+    assert client.get(f"{API}/status").json()["current_version"] == latest
+
+    # 读数不存在 -> 404
+    r = client.post(f"{API}/readings/NO-SUCH/adjudications", json={
+        "request_id": "req-adj-noread", "reading_no": "NO-SUCH",
+        "certificate_no": "CERT-ADJ-1", "certificate_version_seq": 1,
+        "base_version": latest, "reason": "x",
+    })
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "unknown_reading"
+
+    # 证书不存在 -> 404
+    r = client.post(f"{API}/readings/ADJ-1/adjudications", json={
+        "request_id": "req-adj-nocert", "reading_no": "ADJ-1",
+        "certificate_no": "CERT-NOPE", "certificate_version_seq": 1,
+        "base_version": latest, "reason": "x",
+    })
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "unknown_certificate"
+
+    # 证书版本序号不存在 -> 422 selection_not_candidate
+    r = client.post(f"{API}/readings/ADJ-1/adjudications", json={
+        "request_id": "req-adj-noseq", "reading_no": "ADJ-1",
+        "certificate_no": "CERT-ADJ-1", "certificate_version_seq": 99,
+        "base_version": latest, "reason": "x",
+    })
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "selection_not_candidate"
+
+    # 证书存在但不是测量时刻候选（其他设备的证书）-> 422
+    r = client.post(f"{API}/certificates", json={
+        "request_id": "req-adj-other",
+        "certificate_no": "CERT-ADJ-OTHER", "device_no": "DOTHER",
+        "valid_from": "2026-05-01T00:00:00Z", "valid_to": "2026-06-01T00:00:00Z",
+        "min_value": 0.0, "max_value": 1.0,
+    })
+    assert r.status_code == 200
+    other_v = r.json()["version"]
+    # 先对一条新 review 读数基于 other_v 裁决，ADJ-1 此时候选里没有 OTHER
+    r = client.post(f"{API}/readings/ADJ-1/adjudications", json={
+        "request_id": "req-adj-notcand", "reading_no": "ADJ-1",
+        "certificate_no": "CERT-ADJ-OTHER", "certificate_version_seq": 1,
+        "base_version": other_v, "reason": "x",
+    })
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "selection_not_candidate"
+
+    # 非 review 读数不能裁决：提交一条自动 conforming 的读数
+    r = client.post(f"{API}/readings", json={
+        "request_id": "req-adj-uniq-read",
+        "readings": [{
+            "reading_no": "ADJ-UNIQ", "device_no": "DOTHER",
+            "measured_at": "2026-05-10T00:00:00Z", "value": 0.5,
+        }],
+    })
+    assert r.json()["results"][0]["status"] == "conforming"
+    cur = client.get(f"{API}/status").json()["current_version"]
+    r = client.post(f"{API}/readings/ADJ-UNIQ/adjudications", json={
+        "request_id": "req-adj-notreview", "reading_no": "ADJ-UNIQ",
+        "certificate_no": "CERT-ADJ-OTHER", "certificate_version_seq": 1,
+        "base_version": cur, "reason": "x",
+    })
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "reading_not_in_review"
+
+    # path/body reading_no 不一致 -> 422
+    r = client.post(f"{API}/readings/ADJ-1/adjudications", json={
+        "request_id": "req-adj-path", "reading_no": "ADJ-OTHER",
+        "certificate_no": "CERT-ADJ-1", "certificate_version_seq": 1,
+        "base_version": cur, "reason": "x",
+    })
+    assert r.status_code == 422
+    # 全部拒绝后未产生新版本（仅成功签发 OTHER / 提交 UNIQ 占了版本）
+    assert client.get(f"{API}/status").json()["current_version"] == cur
+
+
+def test_19_adjudication_invalidated_by_correction_and_history(client):
+    # ADJ-1 当前裁决选 CERT-ADJ-1 -> conforming。
+    # 再裁决改选 CERT-ADJ-2（5.0 不在 [100,200]）-> out_of_range
+    before = client.get(f"{API}/status").json()["current_version"]
+    first_v = client.get(f"{API}/readings/ADJ-1/adjudications").json()["items"][0]["version"]
+    r = client.post(f"{API}/readings/ADJ-1/adjudications", json={
+        "request_id": "req-adj-switch", "reading_no": "ADJ-1",
+        "certificate_no": "CERT-ADJ-2", "certificate_version_seq": 1,
+        "base_version": before, "reason": "改选第二份",
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "out_of_range"
+    switch_v = r.json()["version"]
+
+    # 纠正所选 CERT-ADJ-2：旧版本在新版本起失效 -> 裁决失效，回到自动 review
+    r = client.post(f"{API}/certificates/CERT-ADJ-2/correct", json={
+        "request_id": "req-adj-c2-fix",
+        "certificate_no": "CERT-ADJ-2", "device_no": "DADJ",
+        "valid_from": "2026-05-01T00:00:00Z", "valid_to": "2026-06-01T00:00:00Z",
+        "min_value": 0.0, "max_value": 100.0,
+        "reason": "范围纠正",
+    })
+    assert r.status_code == 200
+    fix_v = r.json()["version"]
+    aff = {a["reading_no"]: a for a in r.json()["affected_readings"]}
+    assert aff["ADJ-1"]["before"]["status"] == "out_of_range"
+    assert aff["ADJ-1"]["after"]["status"] == "review"
+    assert aff["ADJ-1"]["conclusion_changed"] is True
+    after_adj = aff["ADJ-1"]["after"]["adjudication"]
+    assert after_adj["active"] is False
+    assert after_adj["invalidated"] is True
+    assert after_adj["invalidated_at_version"] == fix_v
+    assert after_adj["invalidation_cause"] == "certificate_corrected"
+
+    # 当前读数回到自动结论并标明裁决失效
+    g = client.get(f"{API}/readings/ADJ-1").json()
+    assert g["status"] == "review"
+    assert g["adjudication"]["active"] is False
+    assert g["adjudication"]["invalidation_cause"] == "certificate_corrected"
+
+    # 旧版本视角：原裁决仍有效、原结论不变
+    g_old = client.get(f"{API}/readings/ADJ-1", params={"at_version": switch_v}).json()
+    assert g_old["status"] == "out_of_range"
+    assert g_old["adjudication"]["active"] is True
+    g_first = client.get(f"{API}/readings/ADJ-1", params={"at_version": first_v}).json()
+    assert g_first["status"] == "conforming"
+    assert g_first["adjudication"]["active"] is True
+    assert g_first["adjudication"]["selected_certificate"]["certificate_no"] == "CERT-ADJ-1"
+
+    # 裁决流水可查：两条，最近一条已失效
+    h = client.get(f"{API}/readings/ADJ-1/adjudications").json()
+    assert h["total"] == 2
+    assert [i["version"] for i in h["items"]] == [first_v, switch_v]
+    last = h["items"][-1]
+    assert last["active"] is False
+    assert last["invalidation_cause"] == "certificate_corrected"
+    assert last["selected_certificate"]["certificate_no"] == "CERT-ADJ-2"
+    # 未知读数的裁决流水 -> 404
+    assert client.get(f"{API}/readings/NO-SUCH/adjudications").status_code == 404
+
+
+def test_20_adjudication_invalidated_by_revoke(client):
+    # 独立设备：裁决后撤销所选证书 -> 失效并回退
+    client.post(f"{API}/certificates", json={
+        "request_id": "req-rv-c1", "certificate_no": "CERT-RV-1", "device_no": "DRV",
+        "valid_from": "2026-07-01T00:00:00Z", "valid_to": "2026-08-01T00:00:00Z",
+        "min_value": 0.0, "max_value": 10.0,
+    })
+    client.post(f"{API}/certificates", json={
+        "request_id": "req-rv-c2", "certificate_no": "CERT-RV-2", "device_no": "DRV",
+        "valid_from": "2026-07-01T00:00:00Z", "valid_to": "2026-08-01T00:00:00Z",
+        "min_value": 0.0, "max_value": 10.0,
+    })
+    r = client.post(f"{API}/readings", json={
+        "request_id": "req-rv-read",
+        "readings": [{
+            "reading_no": "RV-1", "device_no": "DRV",
+            "measured_at": "2026-07-10T00:00:00Z", "value": 5.0,
+        }],
+    })
+    read_v = r.json()["version"]
+    r = client.post(f"{API}/readings/RV-1/adjudications", json={
+        "request_id": "req-rv-adj", "reading_no": "RV-1",
+        "certificate_no": "CERT-RV-1", "certificate_version_seq": 1,
+        "base_version": read_v, "reason": "选 CERT-RV-1",
+    })
+    assert r.json()["status"] == "conforming"
+    adj_v = r.json()["version"]
+
+    r = client.post(f"{API}/certificates/CERT-RV-1/revoke", json={
+        "request_id": "req-rv-revoke", "certificate_no": "CERT-RV-1",
+        "reason": "证书作废",
+    })
+    assert r.status_code == 200
+    revoke_v = r.json()["version"]
+    # 撤销后唯一自动匹配 CERT-RV-2（仍合格），裁决因所选版本撤销而失效
+    g = client.get(f"{API}/readings/RV-1").json()
+    assert g["status"] == "conforming"  # 自动回退：CERT-RV-2 唯一候选且在范围内
+    assert g["reliance"]["certificate_no"] == "CERT-RV-2"
+    assert g["adjudication"]["active"] is False
+    assert g["adjudication"]["invalidation_cause"] == "certificate_revoked"
+    assert g["adjudication"]["invalidated_at_version"] == revoke_v
+
+    # 旧版本视角原裁决仍在
+    g_old = client.get(f"{API}/readings/RV-1", params={"at_version": adj_v}).json()
+    assert g_old["status"] == "conforming"
+    assert g_old["reliance"]["certificate_no"] == "CERT-RV-1"
+    assert g_old["adjudication"]["active"] is True
+
+
+def test_21_audit_package_presents_adjudication_by_version(client):
+    # 取 test_19 的场景：fix_v 时 ADJ-1 裁决已失效（review）；
+    # switch_v 时裁决生效（out_of_range）。同版本包内容/摘要恒定。
+    h = client.get(f"{API}/readings/ADJ-1/adjudications").json()
+    do_v, switch_version = [i["version"] for i in h["items"]]
+    fix_v = h["items"][-1]["invalidated_at_version"]
+
+    params = {
+        "device_no": "DADJ",
+        "measured_from": "2026-05-01T00:00:00Z",
+        "measured_to": "2026-06-01T00:00:00Z",
+    }
+
+    # 裁决版本视角：out_of_range + 生效裁决；候选投影不泄漏未来纠正
+    b = client.get(f"{API}/audit/packages", params={**params, "at_version": switch_version}).json()
+    item = next(i for i in b["items"] if i["reading_no"] == "ADJ-1")
+    assert item["status"] == "out_of_range"
+    assert item["reliance"]["certificate_no"] == "CERT-ADJ-2"
+    assert item["adjudication"]["active"] is True
+    assert item["adjudication"]["adjudicated_at_version"] == switch_version
+    # 所选证书快照投影：superseded_at_version（fix_v）晚于取证版本 -> null
+    assert item["adjudication"]["selected_certificate"]["superseded_at_version"] is None
+    # 候选快照同样投影
+    for cand in item["candidates"]:
+        assert cand["superseded_at_version"] is None
+    # 全部候选保留
+    assert len(item["candidates"]) == 2
+
+    canonical_package = {
+        "spec_version": b["digest"]["spec_version"],
+        "filter": b["filter"],
+        "at_version": b["at_version"],
+        "total_count": b["total_count"],
+        "items": b["items"],
+    }
+    assert b["digest"]["package_digest"] == _sha(_canon(canonical_package))
+
+    # 纠正之后重取同一旧版本包：内容与摘要不变（audit-v1 规则，仅新增固定键）
+    again = client.get(f"{API}/audit/packages", params={**params, "at_version": switch_version}).json()
+    assert again["digest"]["package_digest"] == b["digest"]["package_digest"]
+    assert again["items"] == b["items"]
+    assert b["digest"]["spec_version"] == "audit-v1"
+
+    # 裁决之前的版本：无裁决键内容（null），自动 review
+    early = client.get(f"{API}/audit/packages", params={**params, "at_version": do_v - 1}).json()
+    eitem = next(i for i in early["items"] if i["reading_no"] == "ADJ-1")
+    assert eitem["status"] == "review"
+    assert eitem["adjudication"] is None
+    # 摘要可独立复算（含 adjudication 固定键）
+    ecanon = {
+        "spec_version": early["digest"]["spec_version"],
+        "filter": early["filter"],
+        "at_version": early["at_version"],
+        "total_count": early["total_count"],
+        "items": early["items"],
+    }
+    assert early["digest"]["package_digest"] == _sha(_canon(ecanon))
+
+    # 失效版本视角：回退自动 review，裁决标失效；失效信息可见
+    cur = client.get(f"{API}/audit/packages", params={**params, "at_version": fix_v}).json()
+    citem = next(i for i in cur["items"] if i["reading_no"] == "ADJ-1")
+    assert citem["status"] == "review"
+    assert citem["adjudication"]["active"] is False
+    assert citem["adjudication"]["invalidation_cause"] == "certificate_corrected"
+    assert citem["adjudication"]["invalidated_at_version"] == fix_v
+
+    # 规范化规则补充了裁决说明
+    assert "adjudication" in cur["digest"]["canonical_rules"]["adjudication_rules"]
